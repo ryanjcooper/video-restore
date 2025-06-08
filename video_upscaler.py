@@ -6,8 +6,39 @@ Uses state-of-the-art models like Real-ESRGAN for video restoration and enhancem
 Automatically detects and utilizes available GPUs for optimal performance
 """
 
-import os
+# IMPORTANT: Monkey patch for torchvision compatibility MUST come first
 import sys
+import types
+
+# Create a compatibility layer for deprecated torchvision functional_tensor
+fake_module = types.ModuleType('functional_tensor')
+
+# Dynamically redirect all function calls to torchvision.transforms.functional
+def __getattr__(name):
+    import torchvision.transforms.functional as F
+    if hasattr(F, name):
+        return getattr(F, name)
+    raise AttributeError(f"module 'functional_tensor' has no attribute '{name}'")
+
+fake_module.__getattr__ = __getattr__
+
+# Pre-import torchvision.transforms.functional and copy common functions
+try:
+    import torchvision.transforms.functional as F
+    for func_name in ['rgb_to_grayscale', 'adjust_brightness', 'adjust_contrast', 
+                      'adjust_saturation', 'adjust_hue', 'normalize', 'resize',
+                      'pad', 'crop', 'center_crop', 'resized_crop', 'hflip', 'vflip',
+                      'rotate', 'affine', 'to_tensor', 'to_pil_image', 'to_grayscale']:
+        if hasattr(F, func_name):
+            setattr(fake_module, func_name, getattr(F, func_name))
+except ImportError:
+    pass  # Will handle later in main imports
+
+# Register the fake module
+sys.modules['torchvision.transforms.functional_tensor'] = fake_module
+
+# Now continue with regular imports
+import os
 import cv2
 import torch
 import numpy as np
@@ -25,7 +56,8 @@ import warnings
 
 # Suppress deprecation warnings from torchvision
 warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
-warnings.filterwarnings("ignore", message=".*functional_tensor.*", category=FutureWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*functional.*")
 
 # Third-party imports (install via pip)
 try:
@@ -35,13 +67,8 @@ try:
     
     # Check PyTorch version compatibility
     torch_version = torch.__version__
-    print(f"Using PyTorch {torch_version}")
-    
-    # Fix for torchvision functional_tensor deprecation
-    if hasattr(torchvision.transforms, 'functional_tensor'):
-        # For older torchvision versions, monkey patch to suppress warnings
-        import torchvision.transforms.functional_tensor as F_t
-        torchvision.transforms.functional_tensor = None
+    torchvision_version = torchvision.__version__
+    print(f"Using PyTorch {torch_version}, torchvision {torchvision_version}")
     
     from basicsr.archs.rrdbnet_arch import RRDBNet
     from basicsr.utils.download_util import load_file_from_url
@@ -52,10 +79,8 @@ try:
 except ImportError as e:
     print(f"Missing required package: {e}")
     print("Install with the following commands:")
-    print("pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118")
+    print("pip install torch torchvision torchaudio")
     print("pip install basicsr realesrgan opencv-python ffmpeg-python")
-    print("\nFor the deprecation fix, also run:")
-    print("pip install --upgrade torchvision>=0.15.0")
     sys.exit(1)
 
 @dataclass
