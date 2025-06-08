@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
+# video_upscaler.py
 """
-Professional Video Upscaler for Home Video Restoration
-Optimized for dual RTX 3090 setup with multi-GPU support
-Supports Real-ESRGAN, BSRGAN, and other state-of-the-art models
+Video Restore - AI-Powered Video Upscaler with Multi-GPU Support
+Uses state-of-the-art models like Real-ESRGAN for video restoration and enhancement
+Automatically detects and utilizes available GPUs for optimal performance
 """
 
 import os
@@ -62,7 +63,7 @@ class ProcessingConfig:
     """Configuration for video processing parameters"""
     model_name: str = "RealESRGAN_x4plus"
     scale: int = 4
-    tile_size: int = 512  # Large tiles for RTX 3090
+    tile_size: int = 512  # Default tile size, auto-adjusted based on VRAM
     tile_pad: int = 32
     pre_pad: int = 0
     face_enhance: bool = False
@@ -71,11 +72,14 @@ class ProcessingConfig:
     crf: int = 18  # High quality encoding
     preset: str = "slow"  # Better compression
     audio_copy: bool = True
+    auto_tile_size: bool = True  # Automatically adjust tile size based on VRAM
     
     def __post_init__(self):
         if self.gpu_ids is None:
             # Auto-detect available GPUs
             self.gpu_ids = list(range(torch.cuda.device_count()))
+            if not self.gpu_ids:
+                self.gpu_ids = [0]  # Fallback to single GPU
 
 class ModelManager:
     """Manages AI models and their configurations"""
@@ -168,7 +172,7 @@ class VideoProcessor:
             raise RuntimeError("CUDA not available")
         
         available_gpus = torch.cuda.device_count()
-        print(f"Detected {available_gpus} GPUs")
+        print(f"Detected {available_gpus} GPU{'s' if available_gpus != 1 else ''}")
         
         # Filter valid GPU IDs
         self.config.gpu_ids = [gpu_id for gpu_id in self.config.gpu_ids if gpu_id < available_gpus]
@@ -176,7 +180,34 @@ class VideoProcessor:
         if not self.config.gpu_ids:
             raise RuntimeError("No valid GPUs specified")
         
-        print(f"Using GPUs: {self.config.gpu_ids}")
+        # Auto-adjust tile size based on GPU memory if enabled
+        if self.config.auto_tile_size:
+            self._adjust_tile_size()
+        
+        print(f"Using GPU{'s' if len(self.config.gpu_ids) > 1 else ''}: {self.config.gpu_ids}")
+        print(f"Tile size: {self.config.tile_size}x{self.config.tile_size}")
+    
+    def _adjust_tile_size(self):
+        """Automatically adjust tile size based on available GPU memory"""
+        min_vram = float('inf')
+        
+        # Find minimum VRAM across all selected GPUs
+        for gpu_id in self.config.gpu_ids:
+            if gpu_id < torch.cuda.device_count():
+                props = torch.cuda.get_device_properties(gpu_id)
+                vram_gb = props.total_memory / (1024**3)
+                min_vram = min(min_vram, vram_gb)
+                print(f"GPU {gpu_id} ({props.name}): {vram_gb:.1f}GB VRAM")
+        
+        # Adjust tile size based on minimum VRAM
+        if min_vram < 6:
+            self.config.tile_size = 256
+        elif min_vram < 10:
+            self.config.tile_size = 512
+        elif min_vram < 16:
+            self.config.tile_size = 768
+        else:
+            self.config.tile_size = 1024
     
     def setup_logging(self):
         """Setup logging configuration"""
@@ -241,7 +272,7 @@ class VideoProcessor:
         """Process a batch of frames on specified GPU"""
         upsampler = self.model_manager.load_model(self.config.model_name, gpu_id)
         
-        # Update tile settings for RTX 3090
+        # Update tile settings
         upsampler.tile = self.config.tile_size
         upsampler.tile_pad = self.config.tile_pad
         upsampler.pre_pad = self.config.pre_pad
@@ -489,31 +520,40 @@ class VideoProcessor:
         print(f"Failed: {failed}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Professional Video Upscaler")
+    parser = argparse.ArgumentParser(description="Video Restore - AI-Powered Video Upscaler with Multi-GPU Support")
     parser.add_argument("input", help="Input video file or directory")
     parser.add_argument("output", help="Output video file or directory")
     parser.add_argument("--model", default="RealESRGAN_x4plus", 
                        choices=["RealESRGAN_x4plus", "RealESRGAN_x2plus", "RealESRGAN_x4plus_anime_6B", "RealESRGAN_x4_v3"],
                        help="AI model to use")
     parser.add_argument("--scale", type=int, help="Upscaling factor (overrides model default)")
-    parser.add_argument("--tile-size", type=int, default=512, help="Tile size for processing")
-    parser.add_argument("--gpus", nargs="+", type=int, default=[0, 1], help="GPU IDs to use")
+    parser.add_argument("--tile-size", type=int, help="Tile size for processing (auto-detected by default)")
+    parser.add_argument("--gpus", nargs="+", type=int, help="GPU IDs to use (auto-detect all by default)")
     parser.add_argument("--crf", type=int, default=18, help="Video quality (lower = better)")
     parser.add_argument("--preset", default="slow", help="Encoding preset")
     parser.add_argument("--batch", action="store_true", help="Process directory of videos")
     parser.add_argument("--no-audio", action="store_true", help="Skip audio copying")
+    parser.add_argument("--no-auto-tile", action="store_true", help="Disable automatic tile size adjustment")
     
     args = parser.parse_args()
     
     # Create configuration
     config = ProcessingConfig(
         model_name=args.model,
-        tile_size=args.tile_size,
-        gpu_ids=args.gpus,
         crf=args.crf,
         preset=args.preset,
-        audio_copy=not args.no_audio
+        audio_copy=not args.no_audio,
+        auto_tile_size=not args.no_auto_tile
     )
+    
+    # Set GPU IDs if specified
+    if args.gpus:
+        config.gpu_ids = args.gpus
+    
+    # Set tile size if specified (overrides auto-detection)
+    if args.tile_size:
+        config.tile_size = args.tile_size
+        config.auto_tile_size = False
     
     # Override scale if specified
     if args.scale:
