@@ -2,3 +2,4 @@ models
 temp
 *.log
 test_videos/degraded
+output.mp4
