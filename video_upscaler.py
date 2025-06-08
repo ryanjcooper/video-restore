@@ -6,6 +6,18 @@ Uses state-of-the-art models like Real-ESRGAN for video restoration and enhancem
 Automatically detects and utilizes available GPUs for optimal performance
 """
 
+# Suppress all warnings and set logging levels before any imports
+import warnings
+warnings.filterwarnings("ignore")
+
+import logging
+# Suppress logging from various libraries
+logging.getLogger('basicsr').setLevel(logging.ERROR)
+logging.getLogger('realesrgan').setLevel(logging.ERROR)
+logging.getLogger('torch').setLevel(logging.ERROR)
+logging.getLogger('torchvision').setLevel(logging.ERROR)
+logging.getLogger('numba').setLevel(logging.ERROR)
+
 # IMPORTANT: Monkey patch for torchvision compatibility MUST come first
 import sys
 import types
@@ -53,6 +65,8 @@ import logging
 from dataclasses import dataclass
 import json
 import warnings
+import contextlib
+import io
 
 # Suppress deprecation warnings from torchvision
 warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
@@ -65,10 +79,9 @@ try:
     import torch
     import torchvision
     
-    # Check PyTorch version compatibility
+    # Silently check versions
     torch_version = torch.__version__
     torchvision_version = torchvision.__version__
-    print(f"Using PyTorch {torch_version}, torchvision {torchvision_version}")
     
     from basicsr.archs.rrdbnet_arch import RRDBNet
     from basicsr.utils.download_util import load_file_from_url
@@ -144,16 +157,19 @@ class ModelManager:
     def download_model(self, model_name: str) -> Path:
         """Download model if not exists"""
         if model_name not in self.MODELS:
-            raise ValueError(f"Unknown model: {model_name}")
+            raise ValueError(f"Unknown model: {model_name}. Available models: {', '.join(self.MODELS.keys())}")
         
         model_path = self.model_dir / f"{model_name}.pth"
         if not model_path.exists():
-            print(f"Downloading {model_name}...")
-            load_file_from_url(
-                self.MODELS[model_name]["url"],
-                model_dir=str(self.model_dir),
-                file_name=f"{model_name}.pth"
-            )
+            print(f"Downloading {model_name} model (this may take a few minutes)...")
+            # Suppress verbose output from download_util
+            with contextlib.redirect_stdout(io.StringIO()):
+                load_file_from_url(
+                    self.MODELS[model_name]["url"],
+                    model_dir=str(self.model_dir),
+                    file_name=f"{model_name}.pth"
+                )
+            print(f"✓ Model downloaded successfully")
         return model_path
     
     def load_model(self, model_name: str, gpu_id: int = 0) -> RealESRGANer:
@@ -178,7 +194,8 @@ class ModelManager:
             tile_pad=32,
             pre_pad=0,
             half=True,  # Use FP16 for memory efficiency
-            gpu_id=gpu_id
+            gpu_id=gpu_id,
+            device=torch.device(f'cuda:{gpu_id}')
         )
         
         self.loaded_models[cache_key] = upsampler
@@ -194,10 +211,9 @@ class VideoProcessor:
         
         # Validate GPU availability
         if not torch.cuda.is_available():
-            raise RuntimeError("CUDA not available")
+            raise RuntimeError("CUDA not available - GPU required for video upscaling")
         
         available_gpus = torch.cuda.device_count()
-        print(f"Detected {available_gpus} GPU{'s' if available_gpus != 1 else ''}")
         
         # Filter valid GPU IDs
         self.config.gpu_ids = [gpu_id for gpu_id in self.config.gpu_ids if gpu_id < available_gpus]
@@ -209,8 +225,16 @@ class VideoProcessor:
         if self.config.auto_tile_size:
             self._adjust_tile_size()
         
-        print(f"Using GPU{'s' if len(self.config.gpu_ids) > 1 else ''}: {self.config.gpu_ids}")
+        # Print GPU info
+        print(f"\nGPU Configuration")
+        print(f"{'='*60}")
+        print(f"Available GPUs: {available_gpus}")
+        for gpu_id in self.config.gpu_ids:
+            props = torch.cuda.get_device_properties(gpu_id)
+            print(f"  GPU {gpu_id}: {props.name} ({props.total_memory / (1024**3):.1f}GB)")
         print(f"Tile size: {self.config.tile_size}x{self.config.tile_size}")
+        print(f"Model: {self.config.model_name}")
+        print(f"{'='*60}")
     
     def _adjust_tile_size(self):
         """Automatically adjust tile size based on available GPU memory"""
@@ -222,7 +246,6 @@ class VideoProcessor:
                 props = torch.cuda.get_device_properties(gpu_id)
                 vram_gb = props.total_memory / (1024**3)
                 min_vram = min(min_vram, vram_gb)
-                print(f"GPU {gpu_id} ({props.name}): {vram_gb:.1f}GB VRAM")
         
         # Adjust tile size based on minimum VRAM
         if min_vram < 6:
@@ -236,6 +259,13 @@ class VideoProcessor:
     
     def setup_logging(self):
         """Setup logging configuration"""
+        # Suppress verbose logging from libraries
+        logging.getLogger('basicsr').setLevel(logging.WARNING)
+        logging.getLogger('realesrgan').setLevel(logging.WARNING)
+        logging.getLogger('PIL').setLevel(logging.WARNING)
+        logging.getLogger('numba').setLevel(logging.WARNING)
+        
+        # Configure main logger
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
@@ -245,6 +275,7 @@ class VideoProcessor:
             ]
         )
         self.logger = logging.getLogger(__name__)
+        self.logger.setLevel(logging.INFO)
     
     def get_video_info(self, video_path: str) -> Dict:
         """Extract video information using ffprobe"""
@@ -252,16 +283,23 @@ class VideoProcessor:
             probe = ffmpeg.probe(video_path)
             video_info = next(s for s in probe['streams'] if s['codec_type'] == 'video')
             
+            # Parse frame rate
+            fps_parts = video_info['r_frame_rate'].split('/')
+            if len(fps_parts) == 2:
+                fps = float(fps_parts[0]) / float(fps_parts[1])
+            else:
+                fps = float(fps_parts[0])
+            
             return {
                 'width': int(video_info['width']),
                 'height': int(video_info['height']),
-                'fps': eval(video_info['r_frame_rate']),
-                'duration': float(video_info.get('duration', 0)),
+                'fps': fps,
+                'duration': float(probe['format'].get('duration', 0)),
                 'codec': video_info['codec_name'],
                 'frames': int(video_info.get('nb_frames', 0))
             }
         except Exception as e:
-            self.logger.error(f"Error getting video info: {e}")
+            # Don't print error here, will be handled by caller
             return {}
     
     def extract_frames(self, video_path: str, output_dir: str) -> List[str]:
@@ -272,6 +310,9 @@ class VideoProcessor:
         cap = cv2.VideoCapture(video_path)
         frame_paths = []
         frame_count = 0
+        
+        # Get total frames for progress
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
         try:
             while True:
@@ -284,13 +325,15 @@ class VideoProcessor:
                 frame_paths.append(str(frame_path))
                 frame_count += 1
                 
-                if frame_count % 100 == 0:
-                    print(f"Extracted {frame_count} frames", end='\r')
+                # Progress update
+                if frame_count % 30 == 0 or frame_count == total_frames:
+                    progress = (frame_count / total_frames * 100) if total_frames > 0 else 0
+                    print(f"\rExtracting frames: {frame_count}/{total_frames} ({progress:.1f}%)", end='', flush=True)
         
         finally:
             cap.release()
         
-        print(f"\nExtracted {len(frame_paths)} frames")
+        print(f"\r✓ Extracted {len(frame_paths)} frames" + " " * 20)  # Extra spaces to clear line
         return frame_paths
     
     def process_frame_batch(self, frame_paths: List[str], output_dir: str, gpu_id: int) -> List[str]:
@@ -305,14 +348,16 @@ class VideoProcessor:
         output_dir = Path(output_dir)
         output_paths = []
         
-        for frame_path in frame_paths:
+        # Suppress tile output by redirecting stdout
+        for i, frame_path in enumerate(frame_paths):
             try:
                 # Read frame
                 img = cv2.imread(frame_path, cv2.IMREAD_COLOR)
                 
-                # Upscale
-                with torch.cuda.device(gpu_id):
-                    output, _ = upsampler.enhance(img, outscale=self.config.scale)
+                # Upscale with suppressed output
+                with contextlib.redirect_stdout(io.StringIO()):
+                    with torch.cuda.device(gpu_id):
+                        output, _ = upsampler.enhance(img, outscale=self.config.scale)
                 
                 # Save upscaled frame
                 frame_name = Path(frame_path).name
@@ -321,7 +366,8 @@ class VideoProcessor:
                 output_paths.append(str(output_path))
                 
             except Exception as e:
-                self.logger.error(f"Error processing frame {frame_path}: {e}")
+                # Log error but don't show to user unless in debug mode
+                self.logger.debug(f"Error processing frame {frame_path}: {e}")
                 continue
         
         return output_paths
@@ -343,24 +389,88 @@ class VideoProcessor:
             else:
                 batch = frame_paths[start_idx:start_idx + frames_per_gpu]
             frame_batches.append((batch, gpu_id))
+            print(f"  GPU {gpu_id}: {len(batch)} frames")
         
-        # Process batches in parallel
+        # Process batches in parallel with progress tracking
         all_output_paths = []
+        total_frames = len(frame_paths)
+        
+        # Import tqdm for progress bar
+        try:
+            from tqdm import tqdm
+            use_tqdm = True
+        except ImportError:
+            use_tqdm = False
+        
+        # Create a thread-safe queue for progress updates
+        import queue as thread_queue
+        progress_queue = thread_queue.Queue()
+        
+        if use_tqdm:
+            pbar = tqdm(total=total_frames, desc="Processing frames", unit="frame", 
+                       bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
         
         def process_gpu_batch(batch_info):
             batch_frames, gpu_id = batch_info
-            return self.process_frame_batch(batch_frames, output_dir, gpu_id)
+            return self.process_frame_batch(batch_frames, output_dir, gpu_id, progress_queue)
+        
+        # Start processing in threads
+        import threading
+        all_done = threading.Event()
         
         with ThreadPoolExecutor(max_workers=num_gpus) as executor:
             futures = [executor.submit(process_gpu_batch, batch_info) for batch_info in frame_batches]
             
+            # Monitor progress in separate thread to avoid blocking
+            def monitor_progress():
+                processed_count = 0
+                last_update_time = time.time()
+                
+                while not all_done.is_set() or not progress_queue.empty():
+                    try:
+                        progress_queue.get(timeout=0.1)
+                        processed_count += 1
+                        
+                        if use_tqdm:
+                            pbar.update(1)
+                        else:
+                            current_time = time.time()
+                            if current_time - last_update_time > 1.0:  # Update every second
+                                elapsed = current_time - start_time
+                                fps = processed_count / elapsed if elapsed > 0 else 0
+                                eta = (total_frames - processed_count) / fps if fps > 0 else 0
+                                print(f"\rProcessing: {processed_count}/{total_frames} ({processed_count/total_frames*100:.1f}%) | "
+                                      f"{fps:.1f} FPS | ETA: {eta/60:.1f} min", end='', flush=True)
+                                last_update_time = current_time
+                    except thread_queue.Empty:
+                        continue
+            
+            # Start progress monitor
+            start_time = time.time()
+            if not use_tqdm:
+                monitor_thread = threading.Thread(target=monitor_progress)
+                monitor_thread.start()
+            else:
+                monitor_thread = threading.Thread(target=monitor_progress)
+                monitor_thread.start()
+            
+            # Collect results
             for i, future in enumerate(futures):
                 try:
                     gpu_results = future.result()
                     all_output_paths.extend(gpu_results)
-                    print(f"GPU {self.config.gpu_ids[i]} completed processing")
                 except Exception as e:
-                    self.logger.error(f"GPU {self.config.gpu_ids[i]} error: {e}")
+                    print(f"\n⚠ GPU {self.config.gpu_ids[i]} error: {e}")
+                    self.logger.error(f"GPU {self.config.gpu_ids[i]} processing error: {e}", exc_info=True)
+            
+            # Signal completion
+            all_done.set()
+            monitor_thread.join(timeout=2.0)
+        
+        if use_tqdm:
+            pbar.close()
+        else:
+            print()  # New line after progress
         
         # Sort paths to maintain frame order
         all_output_paths.sort()
@@ -388,13 +498,33 @@ class VideoProcessor:
             video_args['vcodec'] = 'libx265'  # HEVC for better compression
             output_stream = ffmpeg.output(input_stream, output_path, **video_args)
         
-        # Run ffmpeg
+        # Run ffmpeg with simple progress indicator
         try:
-            ffmpeg.run(output_stream, overwrite_output=True, quiet=True)
-            self.logger.info(f"Video reassembled: {output_path}")
+            # Run with progress tracking
+            process = ffmpeg.run_async(output_stream, pipe_stderr=True, overwrite_output=True)
+            
+            # Simple progress indicator
+            print("Encoding video", end='', flush=True)
+            dot_count = 0
+            while True:
+                output = process.stderr.readline()
+                if output == b'' and process.poll() is not None:
+                    break
+                # Show dots for progress (limit to avoid too many)
+                if output and dot_count < 50:
+                    print(".", end='', flush=True)
+                    dot_count += 1
+            print(" Done!")
+            
+            if process.returncode != 0:
+                stderr_output = process.stderr.read()
+                if stderr_output:
+                    raise ffmpeg.Error('ffmpeg', '', stderr_output)
+            
         except ffmpeg.Error as e:
-            self.logger.error(f"FFmpeg error: {e}")
-            raise
+            print(f"\n✗ Error during video encoding: Check ffmpeg installation")
+            self.logger.debug(f"FFmpeg error details: {e}")
+            raise RuntimeError("Video encoding failed")
     
     def add_audio_track(self, video_path: str, original_video: str, output_path: str):
         """Add original audio track to upscaled video"""
@@ -413,11 +543,23 @@ class VideoProcessor:
                 acodec='copy'
             )
             
-            ffmpeg.run(output, overwrite_output=True, quiet=True)
-            self.logger.info(f"Audio track added: {output_path}")
+            ffmpeg.run(output, overwrite_output=True, quiet=True, capture_stdout=True, capture_stderr=True)
+            print("✓ Audio track added successfully")
             
         except Exception as e:
-            self.logger.error(f"Error adding audio: {e}")
+            # Check if the original video has audio
+            try:
+                probe = ffmpeg.probe(original_video)
+                has_audio = any(stream['codec_type'] == 'audio' for stream in probe['streams'])
+                if not has_audio:
+                    print("✓ No audio track in source video")
+                else:
+                    print("⚠ Warning: Could not copy audio track")
+                    self.logger.debug(f"Audio error: {e}")
+            except:
+                print("⚠ Warning: Could not copy audio track")
+                self.logger.debug(f"Audio error: {e}")
+            
             # Copy video without audio if audio processing fails
             import shutil
             shutil.copy2(video_path, output_path)
@@ -429,7 +571,7 @@ class VideoProcessor:
         temp_dir = Path(temp_dir)
         
         if not input_path.exists():
-            self.logger.error(f"Input video not found: {input_path}")
+            print(f"✗ Error: Input video not found: {input_path}")
             return False
         
         # Create output directory
@@ -446,53 +588,63 @@ class VideoProcessor:
                 shutil.rmtree(temp_dir)
             temp_dir.mkdir(parents=True)
             
-            self.logger.info(f"Processing video: {input_path}")
+            print(f"\n{'='*60}")
+            print(f"Processing: {input_path.name}")
+            print(f"{'='*60}")
             
             # Get video information
             video_info = self.get_video_info(str(input_path))
             if not video_info:
+                print("✗ Error: Could not read video information. File may be corrupted.")
                 return False
             
-            print(f"Input resolution: {video_info['width']}x{video_info['height']}")
+            print(f"Input resolution:  {video_info['width']}x{video_info['height']}")
             print(f"Output resolution: {video_info['width']*self.config.scale}x{video_info['height']*self.config.scale}")
             print(f"FPS: {video_info['fps']:.2f}")
+            print(f"Duration: {video_info['duration']:.1f}s")
+            print(f"{'='*60}\n")
             
             # Extract frames
-            print("Extracting frames...")
+            print("Step 1/4: Extracting frames...")
             frame_paths = self.extract_frames(str(input_path), str(frames_dir))
             
             if not frame_paths:
-                self.logger.error("No frames extracted")
+                print("✗ Error: No frames could be extracted from the video")
                 return False
             
             # Process frames with multi-GPU
-            print("Processing frames with AI upscaling...")
+            total_frames = len(frame_paths)
+            print(f"\nStep 2/4: AI upscaling {total_frames} frames with {len(self.config.gpu_ids)} GPU(s)...")
+            print(f"Estimated time: {total_frames / 5 / 60:.1f} minutes @ ~5 FPS")
             start_time = time.time()
             
             upscaled_paths = self.process_frames_multi_gpu(frame_paths, str(upscaled_dir))
             
             processing_time = time.time() - start_time
-            fps_processed = len(upscaled_paths) / processing_time
-            print(f"Processing completed in {processing_time:.1f}s ({fps_processed:.2f} FPS)")
+            fps_processed = len(upscaled_paths) / processing_time if processing_time > 0 else 0
+            print(f"\n✓ AI upscaling completed: {processing_time:.1f}s ({fps_processed:.2f} FPS)")
             
             if not upscaled_paths:
-                self.logger.error("No frames were successfully processed")
+                print("✗ Error: No frames were successfully upscaled")
                 return False
             
             # Reassemble video
-            print("Reassembling video...")
+            print(f"\nStep 3/4: Reassembling video...")
             temp_video = temp_dir / "temp_video.mp4"
             self.reassemble_video(str(upscaled_dir), str(temp_video), video_info)
             
             # Add audio track
-            print("Adding audio track...")
+            print(f"\nStep 4/4: Adding audio track...")
             self.add_audio_track(str(temp_video), str(input_path), str(output_path))
             
-            self.logger.info(f"Video processing completed: {output_path}")
+            print(f"\n{'='*60}")
+            print(f"✓ Success! Output saved to: {output_path}")
+            print(f"{'='*60}\n")
+            
             return True
             
         except Exception as e:
-            self.logger.error(f"Error processing video {input_path}: {e}")
+            print(f"\n✗ Error processing video: {e}")
             return False
         
         finally:
@@ -510,7 +662,7 @@ class VideoProcessor:
         output_dir = Path(output_dir)
         
         if not input_dir.exists():
-            self.logger.error(f"Input directory not found: {input_dir}")
+            print(f"✗ Error: Input directory not found: {input_dir}")
             return
         
         # Find all video files
@@ -520,17 +672,20 @@ class VideoProcessor:
             video_files.extend(input_dir.glob(f"*{ext.upper()}"))
         
         if not video_files:
-            self.logger.error("No video files found")
+            print("✗ Error: No video files found in the directory")
             return
         
-        print(f"Found {len(video_files)} video files")
+        print(f"\nBatch Processing")
+        print(f"{'='*60}")
+        print(f"Found {len(video_files)} video files to process")
+        print(f"{'='*60}\n")
         
         # Process each video
         successful = 0
         failed = 0
         
         for i, video_file in enumerate(video_files, 1):
-            print(f"\n[{i}/{len(video_files)}] Processing: {video_file.name}")
+            print(f"[{i}/{len(video_files)}] {video_file.name}")
             
             output_file = output_dir / f"{video_file.stem}_upscaled{video_file.suffix}"
             temp_dir = Path("temp") / video_file.stem
@@ -540,9 +695,13 @@ class VideoProcessor:
             else:
                 failed += 1
         
-        print(f"\nBatch processing completed:")
-        print(f"Successful: {successful}")
-        print(f"Failed: {failed}")
+        print(f"\n{'='*60}")
+        print(f"Batch Processing Complete")
+        print(f"{'='*60}")
+        print(f"✓ Successful: {successful}")
+        if failed > 0:
+            print(f"✗ Failed: {failed}")
+        print(f"{'='*60}\n")
 
 def main():
     parser = argparse.ArgumentParser(description="Video Restore - AI-Powered Video Upscaler with Multi-GPU Support")
