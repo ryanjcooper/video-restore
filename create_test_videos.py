@@ -141,7 +141,7 @@ def create_blurry_noisy(input_file, output_file):
 def create_old_webcam(input_file, output_file):
     """Create old webcam quality (very low res, bad colors, compression)"""
     filters = [
-        "scale=160:120",
+        "scale=720:480",
         "fps=15",  # Low framerate
         "curves=preset=lighter",  # Overexposed look
         "eq=saturation=0.5:contrast=1.3",  # Washed out colors
