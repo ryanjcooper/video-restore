@@ -1,746 +1,693 @@
 #!/usr/bin/env python3
 # video_upscaler.py
 """
-Video Restore - Optimized AI Video Upscaler
-Rewritten for maximum performance and quality on high-end hardware
+Video Restore - AI-Powered Video Upscaler with Multi-GPU Support
+Fixed version with clean output and proper error handling
 """
 
-import os
-import sys
+# Suppress all warnings and set logging levels before any imports
 import warnings
 warnings.filterwarnings("ignore")
 
-# Set minimal logging before imports
 import logging
-for logger_name in ['basicsr', 'realesrgan', 'torch', 'torchvision', 'numba', 'PIL']:
-    logging.getLogger(logger_name).setLevel(logging.ERROR)
+# Suppress logging from various libraries
+logging.getLogger('basicsr').setLevel(logging.ERROR)
+logging.getLogger('realesrgan').setLevel(logging.ERROR)
+logging.getLogger('torch').setLevel(logging.ERROR)
+logging.getLogger('torchvision').setLevel(logging.ERROR)
+logging.getLogger('numba').setLevel(logging.ERROR)
 
-# CRITICAL: Fix torchvision compatibility BEFORE basicsr imports
+# IMPORTANT: Monkey patch for torchvision compatibility MUST come first
+import sys
 import types
 
-# First, make sure torchvision is imported
-import torch
-import torchvision
-import torchvision.transforms.functional as F
+# Create a compatibility layer for deprecated torchvision functional_tensor
+fake_module = types.ModuleType('functional_tensor')
 
-# Create compatibility module with all needed functions
-fake_module = types.ModuleType('torchvision.transforms.functional_tensor')
+# Dynamically redirect all function calls to torchvision.transforms.functional
+def __getattr__(name):
+    import torchvision.transforms.functional as F
+    if hasattr(F, name):
+        return getattr(F, name)
+    raise AttributeError(f"module 'functional_tensor' has no attribute '{name}'")
 
-# List of functions basicsr might need
-needed_functions = [
-    'rgb_to_grayscale', 'adjust_brightness', 'adjust_contrast',
-    'adjust_saturation', 'adjust_hue', 'normalize', 'resize',
-    'pad', 'crop', 'center_crop', 'resized_crop', 'hflip', 'vflip',
-    'rotate', 'affine', 'to_tensor', 'to_pil_image', 'to_grayscale'
-]
+fake_module.__getattr__ = __getattr__
 
-# Copy functions to fake module
-for func_name in needed_functions:
-    if hasattr(F, func_name):
-        setattr(fake_module, func_name, getattr(F, func_name))
+# Pre-import torchvision.transforms.functional and copy common functions
+try:
+    import torchvision.transforms.functional as F
+    for func_name in ['rgb_to_grayscale', 'adjust_brightness', 'adjust_contrast', 
+                      'adjust_saturation', 'adjust_hue', 'normalize', 'resize',
+                      'pad', 'crop', 'center_crop', 'resized_crop', 'hflip', 'vflip',
+                      'rotate', 'affine', 'to_tensor', 'to_pil_image', 'to_grayscale']:
+        if hasattr(F, func_name):
+            setattr(fake_module, func_name, getattr(F, func_name))
+except ImportError:
+    pass  # Will handle later in main imports
 
-# Also copy all other attributes just in case
-for attr in dir(F):
-    if not attr.startswith('_') and not hasattr(fake_module, attr):
-        try:
-            setattr(fake_module, attr, getattr(F, attr))
-        except:
-            pass
-
-# Register the module
+# Register the fake module
 sys.modules['torchvision.transforms.functional_tensor'] = fake_module
 
-# Now we can import the rest
+# Now continue with regular imports
+import os
 import cv2
+import torch
 import numpy as np
 import argparse
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict, Generator
+from typing import List, Optional, Tuple, Dict
 import threading
 import queue
 import time
-from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
+import logging
+from dataclasses import dataclass
+import json
+import warnings
+import contextlib
+import io
 import subprocess
-import multiprocessing as mp
-from collections import deque
-import gc
 
-# Optimize OpenCV for your hardware
-cv2.setNumThreads(0)  # Let TBB handle threading
-cv2.setUseOptimized(True)
+# Suppress deprecation warnings from torchvision
+warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*functional.*")
 
-# Third-party imports with better error handling
+# Third-party imports (install via pip)
 try:
+    # Import with version compatibility handling
     import torch
     import torchvision
-except ImportError as e:
-    print(f"PyTorch not found: {e}")
-    print("Install with: pip install torch torchvision")
-    sys.exit(1)
-
-try:
+    
+    # Silently check versions
+    torch_version = torch.__version__
+    torchvision_version = torchvision.__version__
+    
     from basicsr.archs.rrdbnet_arch import RRDBNet
     from basicsr.utils.download_util import load_file_from_url
-except ImportError as e:
-    print(f"BasicSR not found: {e}")
-    print("Install with: pip install basicsr")
-    sys.exit(1)
-
-try:
     from realesrgan import RealESRGANer
     from realesrgan.archs.srvgg_arch import SRVGGNetCompact
-except ImportError as e:
-    print(f"Real-ESRGAN not found: {e}")
-    print("Install with: pip install realesrgan")
-    sys.exit(1)
-
-try:
     import ffmpeg
+    
 except ImportError as e:
-    print(f"ffmpeg-python not found: {e}")
-    print("Install with: pip install ffmpeg-python")
+    print(f"Missing required package: {e}")
+    print("Install with the following commands:")
+    print("pip install torch torchvision torchaudio")
+    print("pip install basicsr realesrgan opencv-python ffmpeg-python")
     sys.exit(1)
-
-# Enable CUDA optimizations
-if torch.cuda.is_available():
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
 
 @dataclass
-class OptimizedConfig:
-    """Optimized configuration for high-end hardware"""
+class ProcessingConfig:
+    """Configuration for video processing parameters"""
     model_name: str = "RealESRGAN_x4plus"
     scale: int = 4
-    
-    # GPU settings optimized for RTX 3090
-    gpu_ids: List[int] = field(default_factory=list)
-    tile_size: int = 1536  # Larger tiles for 24GB VRAM
-    tile_overlap: int = 32  # Reduced overlap
-    batch_size: int = 2  # Process multiple frames per GPU
-    use_fp16: bool = True
-    
-    # Output settings
+    tile_size: int = 512  # Default tile size, auto-adjusted based on VRAM
+    tile_pad: int = 32
+    pre_pad: int = 0
+    face_enhance: bool = False
+    gpu_ids: List[int] = None
     output_format: str = "mp4"
-    crf: int = 15
-    preset: str = "slow"
+    crf: int = 18  # High quality encoding
+    preset: str = "slow"  # Better compression
     audio_copy: bool = True
-    
-    # Optimized processing
-    use_gpu_postprocess: bool = True  # GPU-accelerated post-processing
-    temporal_buffer_size: int = 5  # Frames for temporal processing
-    prefetch_frames: int = 32  # Larger prefetch buffer
-    
-    # Quality settings (simplified)
-    denoise: float = 0.0  # Disabled by default - ESRGAN handles this
-    sharpen: float = 0.0  # Disabled by default - causes artifacts
-    color_enhance: bool = False  # Often makes things worse
+    auto_tile_size: bool = True  # Automatically adjust tile size based on VRAM
     
     def __post_init__(self):
-        if not self.gpu_ids:
+        if self.gpu_ids is None:
+            # Auto-detect available GPUs
             self.gpu_ids = list(range(torch.cuda.device_count()))
-        if not self.gpu_ids:
-            raise RuntimeError("No CUDA GPUs available")
+            if not self.gpu_ids:
+                self.gpu_ids = [0]  # Fallback to single GPU
 
-class GPUPostProcessor:
-    """GPU-accelerated post-processing using PyTorch"""
+class ModelManager:
+    """Manages AI models and their configurations"""
     
-    def __init__(self, device: torch.device):
-        self.device = device
-        
-    @torch.no_grad()
-    def process_batch(self, frames: torch.Tensor, denoise: float = 0.0, 
-                     sharpen: float = 0.0) -> torch.Tensor:
-        """Process batch of frames on GPU"""
-        # frames shape: [B, H, W, C] in uint8
-        
-        # Convert to float32 tensor on GPU
-        if not isinstance(frames, torch.Tensor):
-            frames = torch.from_numpy(frames).to(self.device)
-        
-        frames = frames.float() / 255.0
-        
-        # Minimal processing - less is more!
-        if denoise > 0:
-            # Simple bilateral filter approximation on GPU
-            frames = self._gpu_bilateral_filter(frames, denoise)
-        
-        if sharpen > 0:
-            # Unsharp mask on GPU
-            frames = self._gpu_unsharp_mask(frames, sharpen)
-        
-        # Convert back to uint8
-        frames = (frames * 255).clamp(0, 255).byte()
-        return frames
+    MODELS = {
+        "RealESRGAN_x4plus": {
+            "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
+            "scale": 4,
+            "arch": RRDBNet,
+            "arch_params": {"num_in_ch": 3, "num_out_ch": 3, "num_feat": 64, "num_block": 23, "num_grow_ch": 32, "scale": 4}
+        },
+        "RealESRGAN_x2plus": {
+            "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth",
+            "scale": 2,
+            "arch": RRDBNet,
+            "arch_params": {"num_in_ch": 3, "num_out_ch": 3, "num_feat": 64, "num_block": 23, "num_grow_ch": 32, "scale": 2}
+        },
+        "RealESRGAN_x4plus_anime_6B": {
+            "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth",
+            "scale": 4,
+            "arch": RRDBNet,
+            "arch_params": {"num_in_ch": 3, "num_out_ch": 3, "num_feat": 64, "num_block": 6, "num_grow_ch": 32, "scale": 4}
+        },
+        "RealESRGAN_x4_v3": {
+            "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth",
+            "scale": 4,
+            "arch": SRVGGNetCompact,
+            "arch_params": {"num_in_ch": 3, "num_out_ch": 3, "num_feat": 64, "num_conv": 32, "upsampling": 4, "act_type": "prelu"}
+        }
+    }
     
-    def _gpu_bilateral_filter(self, frames: torch.Tensor, strength: float) -> torch.Tensor:
-        """Approximate bilateral filter on GPU"""
-        # Simple Gaussian blur as approximation (much faster)
-        kernel_size = int(5 + strength * 10)
-        if kernel_size % 2 == 0:
-            kernel_size += 1
+    def __init__(self, model_dir: str = "models"):
+        self.model_dir = Path(model_dir)
+        self.model_dir.mkdir(exist_ok=True)
+        self.loaded_models: Dict[str, RealESRGANer] = {}
+    
+    def download_model(self, model_name: str) -> Path:
+        """Download model if not exists"""
+        if model_name not in self.MODELS:
+            raise ValueError(f"Unknown model: {model_name}. Available models: {', '.join(self.MODELS.keys())}")
         
-        # Apply Gaussian blur
-        frames = frames.permute(0, 3, 1, 2)  # BHWC -> BCHW
+        model_path = self.model_dir / f"{model_name}.pth"
+        if not model_path.exists():
+            print(f"Downloading {model_name} model (this may take a few minutes)...")
+            # Suppress verbose output from download_util
+            with contextlib.redirect_stdout(io.StringIO()):
+                load_file_from_url(
+                    self.MODELS[model_name]["url"],
+                    model_dir=str(self.model_dir),
+                    file_name=f"{model_name}.pth"
+                )
+            print(f"✓ Model downloaded successfully")
+        return model_path
+    
+    def load_model(self, model_name: str, gpu_id: int = 0) -> RealESRGANer:
+        """Load and cache model on specified GPU"""
+        cache_key = f"{model_name}_gpu{gpu_id}"
         
-        # Create Gaussian kernel
-        sigma = kernel_size / 3.0
-        kernel = self._gaussian_kernel(kernel_size, sigma).to(self.device)
+        if cache_key in self.loaded_models:
+            return self.loaded_models[cache_key]
         
-        # Apply convolution
-        frames = torch.nn.functional.conv2d(
-            frames, kernel.expand(3, 1, kernel_size, kernel_size),
-            padding=kernel_size//2, groups=3
+        model_path = self.download_model(model_name)
+        model_info = self.MODELS[model_name]
+        
+        # Initialize model architecture
+        model = model_info["arch"](**model_info["arch_params"])
+        
+        # Create upsampler
+        upsampler = RealESRGANer(
+            scale=model_info["scale"],
+            model_path=str(model_path),
+            model=model,
+            tile=512,  # Will be overridden in processing
+            tile_pad=32,
+            pre_pad=0,
+            half=True,  # Use FP16 for memory efficiency
+            gpu_id=gpu_id,
+            device=torch.device(f'cuda:{gpu_id}')
         )
         
-        frames = frames.permute(0, 2, 3, 1)  # BCHW -> BHWC
-        return frames
-    
-    def _gpu_unsharp_mask(self, frames: torch.Tensor, strength: float) -> torch.Tensor:
-        """Unsharp masking on GPU"""
-        blurred = self._gpu_bilateral_filter(frames, 0.3)
-        sharpened = frames + strength * (frames - blurred)
-        return sharpened.clamp(0, 1)
-    
-    @staticmethod
-    def _gaussian_kernel(size: int, sigma: float) -> torch.Tensor:
-        """Create 2D Gaussian kernel"""
-        coords = torch.arange(size, dtype=torch.float32)
-        coords -= size // 2
-        
-        g = torch.exp(-(coords**2) / (2 * sigma**2))
-        g /= g.sum()
-        
-        return g.unsqueeze(0) * g.unsqueeze(1)
+        self.loaded_models[cache_key] = upsampler
+        return upsampler
 
-class OptimizedFrameProcessor:
-    """Optimized frame processing with minimal CPU usage"""
+class VideoProcessor:
+    """Handles video processing with multi-GPU support"""
     
-    def __init__(self, input_path: str, output_path: str, config: OptimizedConfig):
-        self.input_path = input_path
-        self.output_path = output_path
+    def __init__(self, config: ProcessingConfig):
         self.config = config
-        self.video_info = self._get_video_info()
+        self.model_manager = ModelManager()
+        self.setup_logging()
         
-        # Queues with larger capacity
-        self.input_queue = queue.Queue(maxsize=config.prefetch_frames)
-        self.output_queue = queue.PriorityQueue(maxsize=config.prefetch_frames)
+        # Validate GPU availability
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA not available - GPU required for video upscaling")
         
-        # Setup CUDA streams for each GPU
-        self.cuda_streams = {}
-        for gpu_id in config.gpu_ids:
-            self.cuda_streams[gpu_id] = torch.cuda.Stream(device=f'cuda:{gpu_id}')
+        available_gpus = torch.cuda.device_count()
+        
+        # Filter valid GPU IDs
+        self.config.gpu_ids = [gpu_id for gpu_id in self.config.gpu_ids if gpu_id < available_gpus]
+        
+        if not self.config.gpu_ids:
+            raise RuntimeError("No valid GPUs specified")
+        
+        # Auto-adjust tile size based on GPU memory if enabled
+        if self.config.auto_tile_size:
+            self._adjust_tile_size()
+        
+        # Print GPU info
+        print(f"\nGPU Configuration")
+        print(f"{'='*60}")
+        print(f"Available GPUs: {available_gpus}")
+        for gpu_id in self.config.gpu_ids:
+            props = torch.cuda.get_device_properties(gpu_id)
+            print(f"  GPU {gpu_id}: {props.name} ({props.total_memory / (1024**3):.1f}GB)")
+        print(f"Tile size: {self.config.tile_size}x{self.config.tile_size}")
+        print(f"Model: {self.config.model_name}")
+        print(f"{'='*60}")
     
-    def _get_video_info(self) -> Dict:
-        """Get video information efficiently"""
+    def _adjust_tile_size(self):
+        """Automatically adjust tile size based on available GPU memory"""
+        min_vram = float('inf')
+        
+        # Find minimum VRAM across all selected GPUs
+        for gpu_id in self.config.gpu_ids:
+            if gpu_id < torch.cuda.device_count():
+                props = torch.cuda.get_device_properties(gpu_id)
+                vram_gb = props.total_memory / (1024**3)
+                min_vram = min(min_vram, vram_gb)
+        
+        # Adjust tile size based on minimum VRAM
+        if min_vram < 6:
+            self.config.tile_size = 256
+        elif min_vram < 10:
+            self.config.tile_size = 512
+        elif min_vram < 16:
+            self.config.tile_size = 768
+        else:
+            self.config.tile_size = 1024
+    
+    def setup_logging(self):
+        """Setup logging configuration"""
+        # Suppress verbose logging from libraries
+        logging.getLogger('basicsr').setLevel(logging.WARNING)
+        logging.getLogger('realesrgan').setLevel(logging.WARNING)
+        logging.getLogger('PIL').setLevel(logging.WARNING)
+        logging.getLogger('numba').setLevel(logging.WARNING)
+        
+        # Configure main logger
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.StreamHandler(),
+                logging.FileHandler('video_upscaler.log')
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
+        self.logger.setLevel(logging.INFO)
+    
+    def get_video_info(self, video_path: str) -> Dict:
+        """Extract video information using ffprobe"""
         try:
-            probe = ffmpeg.probe(self.input_path)
-            video_stream = next(s for s in probe['streams'] if s['codec_type'] == 'video')
+            probe = ffmpeg.probe(video_path)
+            video_info = next(s for s in probe['streams'] if s['codec_type'] == 'video')
             
-            # Parse framerate
-            fps_str = video_stream['r_frame_rate']
-            if '/' in fps_str:
-                num, den = map(float, fps_str.split('/'))
-                fps = num / den
+            # Parse frame rate
+            fps_parts = video_info['r_frame_rate'].split('/')
+            if len(fps_parts) == 2:
+                fps = float(fps_parts[0]) / float(fps_parts[1])
             else:
-                fps = float(fps_str)
+                fps = float(fps_parts[0])
             
             return {
-                'width': int(video_stream['width']),
-                'height': int(video_stream['height']),
+                'width': int(video_info['width']),
+                'height': int(video_info['height']),
                 'fps': fps,
-                'frames': int(video_stream.get('nb_frames', 0)),
-                'codec': video_stream['codec_name']
+                'duration': float(probe['format'].get('duration', 0)),
+                'codec': video_info['codec_name'],
+                'frames': int(video_info.get('nb_frames', 0))
             }
         except Exception as e:
-            raise RuntimeError(f"Failed to read video info: {e}")
+            # Don't print error here, will be handled by caller
+            return {}
     
-    def decode_frames_gpu(self) -> Generator[np.ndarray, None, None]:
-        """Decode frames using hardware acceleration if available"""
-        # Try hardware decoding first
-        hw_accel = self._detect_hw_accel()
+    def extract_frames(self, video_path: str, output_dir: str) -> List[str]:
+        """Extract frames from video"""
+        output_dir = Path(output_dir)
+        output_dir.mkdir(exist_ok=True)
         
-        cmd = [
-            'ffmpeg',
-            '-loglevel', 'error',
-            '-i', self.input_path,
-        ]
+        cap = cv2.VideoCapture(video_path)
+        frame_paths = []
+        frame_count = 0
         
-        if hw_accel:
-            cmd.extend(['-hwaccel', hw_accel])
-        
-        cmd.extend([
-            '-f', 'rawvideo',
-            '-pix_fmt', 'bgr24',
-            '-'
-        ])
-        
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        
-        frame_size = self.video_info['width'] * self.video_info['height'] * 3
+        # Get total frames for progress
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
         try:
             while True:
-                data = process.stdout.read(frame_size)
-                if not data:
+                ret, frame = cap.read()
+                if not ret:
                     break
                 
-                frame = np.frombuffer(data, dtype=np.uint8).reshape(
-                    self.video_info['height'], self.video_info['width'], 3
-                )
-                yield frame
+                frame_path = output_dir / f"frame_{frame_count:08d}.png"
+                cv2.imwrite(str(frame_path), frame)
+                frame_paths.append(str(frame_path))
+                frame_count += 1
                 
+                # Progress update every 30 frames
+                if frame_count % 30 == 0 or frame_count == total_frames:
+                    progress = (frame_count / total_frames * 100) if total_frames > 0 else 0
+                    print(f"\rExtracting frames: {frame_count}/{total_frames} ({progress:.1f}%)", end='', flush=True)
+        
         finally:
-            process.stdout.close()
-            process.terminate()
-            process.wait()
+            cap.release()
+        
+        print(f"\r✓ Extracted {len(frame_paths)} frames" + " " * 20)
+        return frame_paths
     
-    def _detect_hw_accel(self) -> Optional[str]:
-        """Detect available hardware acceleration"""
-        # Check for NVIDIA GPU decoding
-        try:
-            result = subprocess.run(
-                ['ffmpeg', '-hwaccels'], 
-                capture_output=True, text=True
-            )
-            if 'cuda' in result.stdout:
-                return 'cuda'
-            elif 'nvdec' in result.stdout:
-                return 'nvdec'
-        except:
-            pass
-        return None
-
-class OptimizedVideoUpscaler:
-    """Main upscaler class with optimized pipeline"""
-    
-    def __init__(self, config: OptimizedConfig):
-        self.config = config
-        self.models = {}
-        self.post_processors = {}
+    def process_frame_batch(self, frame_paths: List[str], output_dir: str, gpu_id: int, progress_queue=None) -> List[str]:
+        """Process a batch of frames on specified GPU with clean output"""
+        upsampler = self.model_manager.load_model(self.config.model_name, gpu_id)
         
-        # Initialize models on each GPU
-        self._setup_models()
+        # Update tile settings
+        upsampler.tile = self.config.tile_size
+        upsampler.tile_pad = self.config.tile_pad
+        upsampler.pre_pad = self.config.pre_pad
         
-        # Setup post-processors
-        for gpu_id in config.gpu_ids:
-            device = torch.device(f'cuda:{gpu_id}')
-            self.post_processors[gpu_id] = GPUPostProcessor(device)
+        output_dir = Path(output_dir)
+        output_paths = []
         
-        print(f"\n{'='*60}")
-        print("OPTIMIZED VIDEO UPSCALER")
-        print(f"{'='*60}")
-        print(f"GPUs: {len(config.gpu_ids)} x RTX 3090")
-        print(f"Model: {config.model_name}")
-        print(f"Tile Size: {config.tile_size}x{config.tile_size}")
-        print(f"Batch Size: {config.batch_size}")
-        print(f"{'='*60}\n")
-    
-    def _setup_models(self):
-        """Setup Real-ESRGAN models on each GPU"""
-        model_path = self._download_model()
-        
-        for gpu_id in self.config.gpu_ids:
-            device = torch.device(f'cuda:{gpu_id}')
-            
-            # Create model architecture
-            if self.config.model_name == "RealESRGAN_x4plus":
-                model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, 
-                              num_block=23, num_grow_ch=32, scale=4)
-            elif self.config.model_name == "RealESRGAN_x4_v3":
-                model = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64,
-                                      num_conv=32, upscale=4, act_type='prelu')
-            else:
-                raise ValueError(f"Unsupported model: {self.config.model_name}")
-            
-            # Create upsampler with optimized settings
-            upsampler = RealESRGANer(
-                scale=self.config.scale,
-                model_path=str(model_path),
-                model=model,
-                tile=self.config.tile_size,
-                tile_pad=10,  # Minimal padding
-                pre_pad=0,  # No pre-padding needed
-                half=self.config.use_fp16,
-                gpu_id=gpu_id,
-                device=device
-            )
-            
-            self.models[gpu_id] = upsampler
-    
-    def _download_model(self) -> Path:
-        """Download model if needed"""
-        model_urls = {
-            "RealESRGAN_x4plus": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
-            "RealESRGAN_x4_v3": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth"
-        }
-        
-        model_dir = Path("models")
-        model_dir.mkdir(exist_ok=True)
-        
-        model_path = model_dir / f"{self.config.model_name}.pth"
-        
-        if not model_path.exists():
-            print(f"Downloading {self.config.model_name}...")
-            url = model_urls.get(self.config.model_name)
-            if not url:
-                raise ValueError(f"Unknown model: {self.config.model_name}")
-            
-            # Use basicsr downloader (silent)
-            import contextlib
-            import io
-            with contextlib.redirect_stdout(io.StringIO()):
-                load_file_from_url(url, model_dir=str(model_dir), 
-                                 file_name=f"{self.config.model_name}.pth")
-            print("✓ Download complete")
-        
-        return model_path
-    
-    def process_video(self, input_path: str, output_path: str) -> bool:
-        """Main processing pipeline"""
-        try:
-            processor = OptimizedFrameProcessor(input_path, output_path, self.config)
-            video_info = processor.video_info
-            
-            print(f"Input: {Path(input_path).name}")
-            print(f"Resolution: {video_info['width']}x{video_info['height']} → "
-                  f"{video_info['width'] * self.config.scale}x{video_info['height'] * self.config.scale}")
-            print(f"Frames: {video_info['frames']} @ {video_info['fps']:.2f} FPS")
-            
-            # Start processing threads
-            decode_thread = threading.Thread(
-                target=self._decode_worker,
-                args=(processor,)
-            )
-            
-            process_threads = []
-            for i, gpu_id in enumerate(self.config.gpu_ids):
-                thread = threading.Thread(
-                    target=self._process_worker,
-                    args=(processor, gpu_id, i)
-                )
-                process_threads.append(thread)
-            
-            encode_thread = threading.Thread(
-                target=self._encode_worker,
-                args=(processor,)
-            )
-            
-            # Start all threads
-            decode_thread.start()
-            for thread in process_threads:
-                thread.start()
-            encode_thread.start()
-            
-            # Show progress
-            self._show_progress(processor)
-            
-            # Wait for completion
-            decode_thread.join()
-            for thread in process_threads:
-                thread.join()
-            encode_thread.join()
-            
-            # Copy audio if needed
-            if self.config.audio_copy:
-                self._copy_audio(input_path, output_path)
-            
-            print(f"\n✓ Processing complete: {output_path}")
-            return True
-            
-        except Exception as e:
-            print(f"\n✗ Processing failed: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-    
-    def _decode_worker(self, processor: OptimizedFrameProcessor):
-        """Decode frames and add to queue"""
-        frame_idx = 0
-        for frame in processor.decode_frames_gpu():
-            processor.input_queue.put((frame_idx, frame))
-            frame_idx += 1
-        
-        # Signal end of stream
-        for _ in self.config.gpu_ids:
-            processor.input_queue.put((None, None))
-    
-    def _process_worker(self, processor: OptimizedFrameProcessor, gpu_id: int, worker_id: int):
-        """Process frames on specific GPU"""
-        torch.cuda.set_device(gpu_id)
-        model = self.models[gpu_id]
-        post_processor = self.post_processors[gpu_id]
-        
-        # Frame buffer for batch processing
-        batch_buffer = []
-        batch_indices = []
-        
-        while True:
+        for i, frame_path in enumerate(frame_paths):
             try:
-                frame_idx, frame = processor.input_queue.get(timeout=1.0)
+                # Read frame
+                img = cv2.imread(frame_path, cv2.IMREAD_COLOR)
                 
-                if frame_idx is None:  # End signal
-                    break
+                # Suppress all output including tile information
+                with contextlib.redirect_stdout(io.StringIO()), \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    with torch.cuda.device(gpu_id):
+                        output, _ = upsampler.enhance(img, outscale=self.config.scale)
                 
-                # Only process frames assigned to this worker
-                if frame_idx % len(self.config.gpu_ids) != worker_id:
-                    processor.input_queue.put((frame_idx, frame))
-                    continue
+                # Save upscaled frame
+                frame_name = Path(frame_path).name
+                output_path = output_dir / frame_name
+                cv2.imwrite(str(output_path), output)
+                output_paths.append(str(output_path))
                 
-                batch_buffer.append(frame)
-                batch_indices.append(frame_idx)
+                # Update progress
+                if progress_queue:
+                    progress_queue.put(1)
                 
-                # Process batch when full
-                if len(batch_buffer) >= self.config.batch_size:
-                    self._process_batch(
-                        batch_buffer, batch_indices, model, 
-                        post_processor, processor, gpu_id
-                    )
-                    batch_buffer = []
-                    batch_indices = []
-                    
-            except queue.Empty:
+                # Log progress every 10 frames for debugging
+                if i > 0 and i % 10 == 0:
+                    self.logger.debug(f"GPU {gpu_id}: Processed {i}/{len(frame_paths)} frames")
+                
+            except Exception as e:
+                self.logger.error(f"Error processing frame {frame_path} on GPU {gpu_id}: {e}")
+                if progress_queue:
+                    progress_queue.put(1)  # Still count as processed to avoid hanging
                 continue
         
-        # Process remaining frames
-        if batch_buffer:
-            self._process_batch(
-                batch_buffer, batch_indices, model,
-                post_processor, processor, gpu_id
-            )
+        return output_paths
     
-    def _process_batch(self, frames: List[np.ndarray], indices: List[int],
-                      model: RealESRGANer, post_processor: GPUPostProcessor,
-                      processor: OptimizedFrameProcessor, gpu_id: int):
-        """Process batch of frames efficiently"""
-        with torch.cuda.stream(self.cuda_streams[gpu_id]):
-            # Process each frame
-            enhanced_frames = []
-            
-            for frame in frames:
-                # Use Real-ESRGAN (already optimized internally)
-                with torch.no_grad():
-                    enhanced, _ = model.enhance(frame, outscale=self.config.scale)
-                enhanced_frames.append(enhanced)
-            
-            # Optional GPU post-processing
-            if self.config.use_gpu_postprocess and (self.config.denoise > 0 or self.config.sharpen > 0):
-                # Stack frames for batch processing
-                batch = np.stack(enhanced_frames)
-                batch_tensor = torch.from_numpy(batch).to(f'cuda:{gpu_id}')
-                
-                # Process on GPU
-                processed = post_processor.process_batch(
-                    batch_tensor, 
-                    self.config.denoise,
-                    self.config.sharpen
-                )
-                
-                # Convert back to numpy
-                enhanced_frames = [
-                    processed[i].cpu().numpy() 
-                    for i in range(len(enhanced_frames))
-                ]
-            
-            # Add to output queue
-            for idx, enhanced in zip(indices, enhanced_frames):
-                processor.output_queue.put((idx, enhanced))
-    
-    def _encode_worker(self, processor: OptimizedFrameProcessor):
-        """Encode frames to output video"""
-        video_info = processor.video_info
-        width = video_info['width'] * self.config.scale
-        height = video_info['height'] * self.config.scale
+    def process_frames_multi_gpu(self, frame_paths: List[str], output_dir: str) -> List[str]:
+        """Process frames using multiple GPUs with clean progress display"""
+        output_dir = Path(output_dir)
+        output_dir.mkdir(exist_ok=True)
         
-        # Setup FFmpeg encoder with optimized settings
-        cmd = [
-            'ffmpeg',
-            '-y',
-            '-f', 'rawvideo',
-            '-vcodec', 'rawvideo',
-            '-s', f'{width}x{height}',
-            '-pix_fmt', 'bgr24',
-            '-r', str(video_info['fps']),
-            '-i', '-',
-            '-an',
-            '-vcodec', 'libx264',
-            '-crf', str(self.config.crf),
-            '-preset', self.config.preset,
-            '-pix_fmt', 'yuv420p',
-            '-movflags', '+faststart',
-            processor.output_path
-        ]
+        # Distribute frames across GPUs
+        num_gpus = len(self.config.gpu_ids)
+        frames_per_gpu = len(frame_paths) // num_gpus
+        frame_batches = []
         
-        process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        for i, gpu_id in enumerate(self.config.gpu_ids):
+            start_idx = i * frames_per_gpu
+            if i == num_gpus - 1:  # Last GPU gets remaining frames
+                batch = frame_paths[start_idx:]
+            else:
+                batch = frame_paths[start_idx:start_idx + frames_per_gpu]
+            frame_batches.append((batch, gpu_id))
+            print(f"  GPU {gpu_id}: {len(batch)} frames")
         
-        # Write frames in order
-        expected_idx = 0
-        frame_buffer = {}
+        # Process batches in parallel with clean progress tracking
+        all_output_paths = []
+        total_frames = len(frame_paths)
         
-        while expected_idx < video_info['frames']:
-            try:
-                idx, frame = processor.output_queue.get(timeout=5.0)
-                frame_buffer[idx] = frame
-                
-                # Write all consecutive frames
-                while expected_idx in frame_buffer:
-                    process.stdin.write(frame_buffer[expected_idx].tobytes())
-                    del frame_buffer[expected_idx]
-                    expected_idx += 1
-                    
-            except queue.Empty:
-                if expected_idx < video_info['frames'] - 1:
-                    print(f"\nWarning: Timeout waiting for frame {expected_idx}")
-                break
-        
-        process.stdin.close()
-        process.wait()
-    
-    def _show_progress(self, processor: OptimizedFrameProcessor):
-        """Show processing progress"""
-        total_frames = processor.video_info['frames']
-        
+        # Import tqdm for progress bar
         try:
             from tqdm import tqdm
-            pbar = tqdm(total=total_frames, desc="Processing", unit="frames")
-            
-            last_count = 0
-            while last_count < total_frames:
-                current_count = processor.output_queue.qsize()
-                if current_count > last_count:
-                    pbar.update(current_count - last_count)
-                    last_count = current_count
-                time.sleep(0.1)
-            
-            pbar.close()
-            
+            use_tqdm = True
         except ImportError:
-            # Fallback progress
-            print("Processing frames...")
-            while processor.output_queue.qsize() < total_frames:
-                time.sleep(1)
+            use_tqdm = False
+        
+        # Create a thread-safe queue for progress updates
+        import queue as thread_queue
+        progress_queue = thread_queue.Queue()
+        
+        # Initialize progress bar with clean format
+        if use_tqdm:
+            pbar = tqdm(
+                total=total_frames, 
+                desc="Processing frames", 
+                unit="frame",
+                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt:.2s}]',
+                ncols=80,
+                leave=True,
+                dynamic_ncols=False
+            )
+        
+        def process_gpu_batch(batch_info):
+            batch_frames, gpu_id = batch_info
+            return self.process_frame_batch(batch_frames, output_dir, gpu_id, progress_queue)
+        
+        # Progress monitoring thread
+        def monitor_progress():
+            processed = 0
+            while processed < total_frames:
+                try:
+                    # Wait for progress update with timeout
+                    progress_queue.get(timeout=1.0)
+                    processed += 1
+                    if use_tqdm:
+                        pbar.update(1)
+                except queue.Empty:
+                    continue
+        
+        # Start progress monitor
+        progress_thread = threading.Thread(target=monitor_progress, daemon=True)
+        progress_thread.start()
+        
+        # Start processing in parallel
+        with ThreadPoolExecutor(max_workers=num_gpus) as executor:
+            futures = [executor.submit(process_gpu_batch, batch_info) for batch_info in frame_batches]
+            
+            # Collect results
+            for future in futures:
+                try:
+                    batch_results = future.result()
+                    all_output_paths.extend(batch_results)
+                except Exception as e:
+                    self.logger.error(f"Error in GPU batch processing: {e}")
+        
+        # Wait for progress thread to finish
+        progress_thread.join(timeout=5)
+        
+        if use_tqdm:
+            pbar.close()
+        
+        # Sort output paths to maintain frame order
+        all_output_paths.sort()
+        return all_output_paths
     
-    def _copy_audio(self, input_path: str, output_path: str):
-        """Copy audio track efficiently"""
-        temp_path = output_path + '.temp.mp4'
+    def reassemble_video(self, frame_dir: str, output_video: str, fps: float) -> bool:
+        """Reassemble frames into video with preserved audio"""
+        frame_dir = Path(frame_dir)
+        frame_pattern = str(frame_dir / "frame_%08d.png")
         
         try:
-            (
-                ffmpeg
-                .output(
-                    ffmpeg.input(output_path)['v'],
-                    ffmpeg.input(input_path)['a'],
-                    temp_path,
-                    vcodec='copy',
-                    acodec='copy'
-                )
-                .overwrite_output()
-                .run(quiet=True)
-            )
+            # First check if we have frames
+            frame_files = list(frame_dir.glob("frame_*.png"))
+            if not frame_files:
+                self.logger.error("No frames found for reassembly")
+                return False
             
-            os.replace(temp_path, output_path)
+            print(f"Step 4/4: Reassembling {len(frame_files)} frames into video...")
             
-        except ffmpeg.Error:
-            # No audio track or error
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
+            # Build ffmpeg command
+            cmd = [
+                "ffmpeg", "-y",
+                "-framerate", str(fps),
+                "-i", frame_pattern,
+                "-c:v", "libx264",
+                "-preset", self.config.preset,
+                "-crf", str(self.config.crf),
+                "-pix_fmt", "yuv420p",
+                output_video
+            ]
+            
+            # Run ffmpeg with suppressed output
+            with contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                print("✓ Video reassembly complete")
+                return True
+            else:
+                self.logger.error(f"FFmpeg error: {result.stderr}")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"Error reassembling video: {e}")
+            return False
+    
+    def copy_audio(self, input_video: str, output_video: str) -> bool:
+        """Copy audio from input to output video"""
+        try:
+            temp_video = output_video + ".temp.mp4"
+            
+            # Build ffmpeg command to copy audio
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", output_video,
+                "-i", input_video,
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                temp_video
+            ]
+            
+            # Run with suppressed output
+            with contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                # Replace original with audio version
+                os.replace(temp_video, output_video)
+                print("✓ Audio copied successfully")
+                return True
+            else:
+                # Clean up temp file if it exists
+                if os.path.exists(temp_video):
+                    os.remove(temp_video)
+                self.logger.warning("No audio track found or error copying audio")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"Error copying audio: {e}")
+            return False
+    
+    def process_video(self, input_video: str, output_video: str) -> bool:
+        """Complete video processing pipeline"""
+        import tempfile
+        import shutil
+        import subprocess
+        
+        input_video = Path(input_video)
+        output_video = Path(output_video)
+        
+        if not input_video.exists():
+            self.logger.error(f"Input video not found: {input_video}")
+            return False
+        
+        # Get video info
+        video_info = self.get_video_info(str(input_video))
+        if not video_info:
+            self.logger.error("Could not read video information")
+            return False
+        
+        # Print processing info
+        print(f"\n{'='*60}")
+        print(f"Processing: {input_video.name}")
+        print(f"{'='*60}")
+        print(f"Input resolution:  {video_info['width']}x{video_info['height']}")
+        print(f"Output resolution: {video_info['width'] * self.config.scale}x{video_info['height'] * self.config.scale}")
+        print(f"FPS: {video_info['fps']:.2f}")
+        print(f"Duration: {video_info['duration']:.1f}s")
+        print(f"{'='*60}")
+        
+        # Create temporary directories
+        with tempfile.TemporaryDirectory(prefix="video_upscale_") as temp_dir:
+            temp_path = Path(temp_dir)
+            frames_dir = temp_path / "frames"
+            upscaled_dir = temp_path / "upscaled"
+            
+            try:
+                # Step 1: Extract frames
+                print(f"\nStep 1/4: Extracting frames...")
+                frame_paths = self.extract_frames(str(input_video), str(frames_dir))
+                
+                if not frame_paths:
+                    self.logger.error("No frames extracted")
+                    return False
+                
+                # Step 2: Process frames
+                print(f"\nStep 2/4: AI upscaling {len(frame_paths)} frames with {len(self.config.gpu_ids)} GPU(s)...")
+                
+                # Estimate processing time
+                estimated_fps = 5 * len(self.config.gpu_ids)  # Rough estimate
+                estimated_time = len(frame_paths) / estimated_fps / 60
+                print(f"Estimated time: {estimated_time:.1f} minutes @ ~{estimated_fps} FPS")
+                
+                upscaled_paths = self.process_frames_multi_gpu(frame_paths, str(upscaled_dir))
+                
+                if not upscaled_paths:
+                    self.logger.error("No frames processed successfully")
+                    return False
+                
+                print(f"✓ Processed {len(upscaled_paths)} frames")
+                
+                # Step 3: Reassemble video
+                success = self.reassemble_video(str(upscaled_dir), str(output_video), video_info['fps'])
+                
+                if not success:
+                    return False
+                
+                # Step 4: Copy audio if enabled and available
+                if self.config.audio_copy:
+                    print("Copying audio track...")
+                    self.copy_audio(str(input_video), str(output_video))
+                
+                # Get output file size
+                output_size = output_video.stat().st_size / (1024 * 1024)
+                print(f"\n✓ Processing complete!")
+                print(f"Output: {output_video} ({output_size:.1f} MB)")
+                
+                return True
+                
+            except Exception as e:
+                self.logger.error(f"Error in processing pipeline: {e}")
+                return False
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Optimized AI Video Upscaler for High-End Hardware",
+        description="AI-powered video upscaling with multi-GPU support",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic usage (auto-detects GPUs)
   python video_upscaler.py input.mp4 output.mp4
-  
-  # Maximum quality
-  python video_upscaler.py input.mp4 output.mp4 --quality max
-  
-  # Use specific GPUs
-  python video_upscaler.py input.mp4 output.mp4 --gpus 0 1
-  
-  # Batch processing
+  python video_upscaler.py input.mp4 output.mp4 --model RealESRGAN_x2plus
+  python video_upscaler.py input.mp4 output.mp4 --gpus 0 1 --tile-size 768
   python video_upscaler.py input_dir/ output_dir/ --batch
         """
     )
     
-    parser.add_argument("input", help="Input video or directory")
-    parser.add_argument("output", help="Output video or directory")
-    
-    parser.add_argument("--model", default="RealESRGAN_x4plus",
-                       choices=["RealESRGAN_x4plus", "RealESRGAN_x4_v3"],
-                       help="AI model (x4plus=quality, v3=speed)")
-    
+    parser.add_argument("input", help="Input video file or directory (for batch processing)")
+    parser.add_argument("output", help="Output video file or directory")
+    parser.add_argument("--model", default="RealESRGAN_x4plus", 
+                       choices=["RealESRGAN_x4plus", "RealESRGAN_x2plus", "RealESRGAN_x4plus_anime_6B", "RealESRGAN_x4_v3"],
+                       help="AI model to use for upscaling")
     parser.add_argument("--gpus", type=int, nargs="+", default=None,
-                       help="GPU IDs to use (default: all)")
-    
-    parser.add_argument("--quality", choices=["fast", "balanced", "max"], 
-                       default="balanced", help="Quality preset")
-    
+                       help="GPU IDs to use (default: auto-detect all)")
     parser.add_argument("--tile-size", type=int, default=None,
-                       help="Tile size (default: auto)")
-    
-    parser.add_argument("--batch-size", type=int, default=None,
-                       help="Frames per batch (default: auto)")
-    
-    parser.add_argument("--crf", type=int, default=None,
-                       help="Video quality (0-51, lower=better)")
-    
-    parser.add_argument("--preset", default=None,
-                       choices=["ultrafast", "fast", "medium", "slow", "veryslow"],
-                       help="Encoding speed/quality")
-    
+                       help="Tile size for processing (default: auto-adjust based on VRAM)")
+    parser.add_argument("--crf", type=int, default=18,
+                       help="Video quality (lower = better quality, larger file)")
+    parser.add_argument("--preset", default="slow",
+                       choices=["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"],
+                       help="Encoding speed vs compression efficiency")
     parser.add_argument("--no-audio", action="store_true",
-                       help="Don't copy audio")
-    
+                       help="Don't copy audio track")
     parser.add_argument("--batch", action="store_true",
-                       help="Process directory")
-    
-    # Post-processing (usually makes things worse)
-    parser.add_argument("--denoise", type=float, default=0.0,
-                       help="Denoising (0-1, default: 0)")
-    parser.add_argument("--sharpen", type=float, default=0.0,
-                       help="Sharpening (0-1, default: 0)")
+                       help="Process all videos in input directory")
     
     args = parser.parse_args()
     
-    # Configure quality presets
-    if args.quality == "max":
-        crf = args.crf or 12
-        preset = args.preset or "veryslow"
-        tile_size = args.tile_size or 2048
-        batch_size = args.batch_size or 1
-    elif args.quality == "fast":
-        crf = args.crf or 18
-        preset = args.preset or "fast"
-        tile_size = args.tile_size or 1024
-        batch_size = args.batch_size or 4
-    else:  # balanced
-        crf = args.crf or 15
-        preset = args.preset or "slow"
-        tile_size = args.tile_size or 1536
-        batch_size = args.batch_size or 2
-    
-    # Create configuration
-    config = OptimizedConfig(
+    # Create processing configuration
+    config = ProcessingConfig(
         model_name=args.model,
         gpu_ids=args.gpus,
-        tile_size=tile_size,
-        batch_size=batch_size,
-        crf=crf,
-        preset=preset,
-        audio_copy=not args.no_audio,
-        denoise=args.denoise,
-        sharpen=args.sharpen,
-        use_gpu_postprocess=args.denoise > 0 or args.sharpen > 0
+        crf=args.crf,
+        preset=args.preset,
+        audio_copy=not args.no_audio
     )
     
-    # Set scale based on model
-    config.scale = 4  # All current models are 4x
+    # Override tile size if specified
+    if args.tile_size:
+        config.tile_size = args.tile_size
+        config.auto_tile_size = False
+    
+    # Update scale based on model
+    if "x2" in args.model:
+        config.scale = 2
+    elif "x4" in args.model:
+        config.scale = 4
     
     try:
-        upscaler = OptimizedVideoUpscaler(config)
+        processor = VideoProcessor(config)
         
         if args.batch:
             # Batch processing
@@ -748,37 +695,46 @@ Examples:
             output_dir = Path(args.output)
             
             if not input_dir.is_dir():
-                print(f"Error: {input_dir} is not a directory")
+                print(f"Error: Input directory not found: {input_dir}")
                 return 1
             
             output_dir.mkdir(parents=True, exist_ok=True)
             
-            video_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
-            videos = [f for f in input_dir.iterdir() 
-                     if f.suffix.lower() in video_extensions]
+            # Find video files
+            video_extensions = {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".wmv"}
+            video_files = [f for f in input_dir.iterdir() 
+                          if f.suffix.lower() in video_extensions]
             
-            if not videos:
-                print(f"No videos found in {input_dir}")
+            if not video_files:
+                print(f"No video files found in {input_dir}")
                 return 1
             
-            print(f"\nBatch processing {len(videos)} videos\n")
+            print(f"Found {len(video_files)} videos to process")
             
-            for video in videos:
-                output_path = output_dir / f"{video.stem}_upscaled{video.suffix}"
-                upscaler.process_video(str(video), str(output_path))
+            # Process each video
+            success_count = 0
+            for video_file in video_files:
+                output_file = output_dir / f"{video_file.stem}_upscaled{video_file.suffix}"
+                print(f"\nProcessing {video_file.name}...")
                 
+                if processor.process_video(str(video_file), str(output_file)):
+                    success_count += 1
+                else:
+                    print(f"Failed to process {video_file.name}")
+            
+            print(f"\nBatch processing complete: {success_count}/{len(video_files)} videos processed successfully")
+            
         else:
-            # Single video
-            upscaler.process_video(args.input, args.output)
-        
-        return 0
-        
+            # Single video processing
+            success = processor.process_video(args.input, args.output)
+            return 0 if success else 1
+            
     except KeyboardInterrupt:
-        print("\n\nProcessing interrupted")
+        print("\nProcessing interrupted by user")
         return 1
     except Exception as e:
-        print(f"\nError: {e}")
+        print(f"Error: {e}")
         return 1
 
 if __name__ == "__main__":
-    sys.exit(main())
+    exit(main())
